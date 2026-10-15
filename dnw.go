@@ -1,9 +1,11 @@
 package tensorutils
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/JoshuaDoes/crunchio"
@@ -90,7 +92,7 @@ func closeGhostsDNW() {
 }
 
 type DNW struct {
-	port serial.Port
+	port dnwPort
 	info *enumerator.PortDetails
 
 	buffer *crunchio.Buffer //Used for writing the message queue
@@ -98,6 +100,14 @@ type DNW struct {
 
 	mutex  sync.Mutex
 	closed bool
+}
+
+type dnwPort interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	Drain() error
+	Close() error
+	SetReadTimeout(time.Duration) error
 }
 
 func (dnw *DNW) ReadMsg() (*Message, error) {
@@ -279,14 +289,31 @@ func (dnw *DNW) Write(p []byte) (int, error) {
 	return dnw.write(p)
 }
 func (dnw *DNW) write(p []byte) (int, error) {
-	n, err := dnw.port.Write(p)
-	if err != nil {
-		return n, err
+	wrote := 0
+	for wrote < len(p) {
+		n, err := dnw.port.Write(p[wrote:])
+		wrote += n
+		if err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			return wrote, err
+		}
+		if n == 0 {
+			return wrote, io.ErrShortWrite
+		}
 	}
-	if err := dnw.port.Drain(); err != nil {
-		return n, err
+
+	for {
+		if err := dnw.port.Drain(); err != nil {
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
+			return wrote, err
+		}
+		break
 	}
-	return n, nil
+	return wrote, nil
 }
 
 func (dnw *DNW) Close() error {
